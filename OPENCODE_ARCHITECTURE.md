@@ -805,6 +805,381 @@ sequenceDiagram
    - Concurrent tool execution
    - Error recovery and retries
 
+### 1.10 Tool Calling Deep Dive
+
+#### 1.10.1 Tool Definition Interface
+
+Tools are defined using a type-safe builder pattern (`packages/opencode/src/tool/tool.ts:44-70`):
+
+```typescript
+export function define<Parameters extends z.ZodType, Result extends Metadata>(
+  id: string,
+  init: Info<Parameters, Result>["init"] | Awaited<ReturnType<Info<Parameters, Result>["init"]>>,
+): Info<Parameters, Result> {
+  return {
+    id,
+    init: async (ctx) => {
+      const toolInfo = init instanceof Function ? await init(ctx) : init
+      const execute = toolInfo.execute
+      // Wrap execute with Zod validation
+      toolInfo.execute = (args, ctx) => {
+        try {
+          toolInfo.parameters.parse(args)  // Validate before execution
+        } catch (error) {
+          if (error instanceof z.ZodError && toolInfo.formatValidationError) {
+            throw new Error(toolInfo.formatValidationError(error), { cause: error })
+          }
+          throw new Error(
+            `The ${id} tool was called with invalid arguments: ${error}...`,
+            { cause: error }
+          )
+        }
+        return execute(args, ctx)
+      }
+      return toolInfo
+    },
+  }
+}
+```
+
+**Tool Context** passed to every tool execution:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `sessionID` | `string` | Current session identifier |
+| `messageID` | `string` | Message that triggered this tool call |
+| `agent` | `string` | Active agent ID |
+| `abort` | `AbortSignal` | For cancellation handling |
+| `callID` | `string?` | Unique tool call identifier |
+| `metadata()` | `function` | Update tool's display title/metadata |
+
+#### 1.10.2 Tool Registry Architecture
+
+The registry (`packages/opencode/src/tool/registry.ts`) manages tool discovery and initialization:
+
+```typescript
+// Built-in tools (registry.ts:92-111)
+return [
+  InvalidTool,      // Fallback for unknown tools
+  BashTool,         // Shell command execution
+  ReadTool,         // File reading
+  GlobTool,         // File pattern matching
+  GrepTool,         // Content search (ripgrep)
+  EditTool,         // File editing (string replacement)
+  WriteTool,        // File creation/overwriting
+  TaskTool,         // Subagent delegation
+  WebFetchTool,     // HTTP requests
+  TodoWriteTool,    // Task list management
+  TodoReadTool,     // Task list reading
+  WebSearchTool,    // Web search (Exa)
+  CodeSearchTool,   // Code search (Exa)
+  SkillTool,        // Skill/plugin invocation
+  ...(Flag.OPENCODE_EXPERIMENTAL_LSP_TOOL ? [LspTool] : []),  // LSP operations
+  ...(config.experimental?.batch_tool === true ? [BatchTool] : []),
+  ...custom,        // Custom/plugin tools
+]
+```
+
+**Custom Tool Discovery** (`registry.ts:33-57`):
+1. Scans `tool/*.{js,ts}` in config directories
+2. Loads tools from installed plugins via `Plugin.list()`
+3. Wraps plugin tools with `fromPlugin()` adapter
+
+#### 1.10.3 Tool Execution Flow
+
+```mermaid
+sequenceDiagram
+    participant LLM
+    participant Processor as SessionProcessor
+    participant Registry as ToolRegistry
+    participant Tool
+    participant Bus
+
+    LLM->>Processor: tool-call event (toolName, args)
+    Processor->>Processor: Create pending tool part in message
+
+    Note over Processor: tool-call-delta events update args
+
+    LLM->>Processor: tool-call complete
+    Processor->>Registry: tools.get(toolName)
+    Registry-->>Processor: Tool.Info (with execute fn)
+
+    Processor->>Tool: execute(args, context)
+    Tool->>Tool: parameters.parse(args)  [Zod validation]
+
+    alt Validation fails
+        Tool-->>Processor: Error with formatted message
+        Processor->>Processor: Mark tool part as error
+    else Validation passes
+        Tool->>Tool: Perform operation
+        Tool-->>Processor: {title, metadata, output}
+        Processor->>Bus: publish(ToolCompleted)
+        Processor->>Processor: Update tool part (completed)
+    end
+
+    Processor-->>LLM: Continue with tool result
+```
+
+#### 1.10.4 Tool Permission System
+
+Agent permissions control tool availability (`registry.ts:139-160`):
+
+```typescript
+export async function enabled(agent: Agent.Info): Promise<Record<string, boolean>> {
+  const result: Record<string, boolean> = {}
+
+  if (agent.permission.edit === "deny") {
+    result["edit"] = false
+    result["write"] = false
+  }
+  if (agent.permission.bash["*"] === "deny" && Object.keys(agent.permission.bash).length === 1) {
+    result["bash"] = false
+  }
+  if (agent.permission.webfetch === "deny") {
+    result["webfetch"] = false
+    result["codesearch"] = false
+    result["websearch"] = false
+  }
+  if (agent.permission.skill["*"] === "deny" && Object.keys(agent.permission.skill).length === 1) {
+    result["skill"] = false
+  }
+
+  return result
+}
+```
+
+#### 1.10.5 Built-in Tool Reference
+
+| Tool ID | File | Parameters | Purpose |
+|---------|------|------------|---------|
+| `bash` | `bash.ts` | `command`, `timeout?`, `description?` | Execute shell commands |
+| `read` | `read.ts` | `filePath`, `offset?`, `limit?` | Read file contents |
+| `write` | `write.ts` | `filePath`, `content` | Create/overwrite files |
+| `edit` | `edit.ts` | `filePath`, `oldString`, `newString`, `replaceAll?` | String replacement |
+| `glob` | `glob.ts` | `pattern`, `path?` | File pattern matching |
+| `grep` | `grep.ts` | `pattern`, `path?`, `glob?`, `type?`, `output_mode?` | Content search |
+| `task` | `task.ts` | `prompt`, `description`, `subagent_type` | Spawn subagent |
+| `webfetch` | `webfetch.ts` | `url`, `prompt` | Fetch and analyze web content |
+| `todowrite` | `todo.ts` | `todos[]` | Update task list |
+| `todoread` | `todo.ts` | (none) | Read current task list |
+| `websearch` | `websearch.ts` | `query` | Web search via Exa |
+| `codesearch` | `codesearch.ts` | `query` | Code search via Exa |
+| `skill` | `skill.ts` | `skill` | Invoke a skill/plugin |
+| `lsp` | `lsp.ts` | `operation`, `filePath`, `line`, `character` | LSP operations |
+
+### 1.11 LSP Integration
+
+OpenCode integrates with Language Server Protocol (LSP) servers for code intelligence features like diagnostics, go-to-definition, and symbol search.
+
+#### 1.11.1 LSP Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         OpenCode                                 │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
+│  │   LSP       │    │   LSPClient │    │   Tool System       │  │
+│  │  (index.ts) │───▶│  (client.ts)│◀───│   (lsp.ts tool)     │  │
+│  │  Namespace  │    │  JSON-RPC   │    │                     │  │
+│  └─────────────┘    └──────┬──────┘    └─────────────────────┘  │
+│                            │                                      │
+└────────────────────────────┼──────────────────────────────────────┘
+                             │ stdio (JSON-RPC)
+                             ▼
+    ┌────────────────────────────────────────────────────────────┐
+    │                    LSP Servers                              │
+    │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐       │
+    │  │typescript│ │  gopls   │ │rust-ana- │ │  pyright │ ...   │
+    │  │-language-│ │          │ │  lyzer   │ │          │       │
+    │  │ server   │ │          │ │          │ │          │       │
+    │  └──────────┘ └──────────┘ └──────────┘ └──────────┘       │
+    └────────────────────────────────────────────────────────────┘
+```
+
+#### 1.11.2 Supported LSP Servers
+
+OpenCode auto-discovers and spawns language servers based on file extensions and project markers:
+
+| Server ID | Languages | Root Detection | Auto-Install |
+|-----------|-----------|----------------|--------------|
+| `typescript` | `.ts`, `.tsx`, `.js`, `.jsx` | `package-lock.json`, `bun.lockb`, etc. | Via `bun x typescript-language-server` |
+| `deno` | `.ts`, `.tsx`, `.js`, `.jsx` | `deno.json`, `deno.jsonc` | Requires `deno` CLI |
+| `gopls` | `.go` | `go.mod`, `go.work` | Auto-installs via `go install` |
+| `rust` | `.rs` | `Cargo.toml` | Requires `rust-analyzer` |
+| `pyright` | `.py`, `.pyi` | `pyproject.toml`, `requirements.txt` | Auto-installs via `bun install` |
+| `eslint` | `.ts`, `.tsx`, `.js`, `.jsx`, `.vue` | Package lockfile + `eslint` dep | Downloads VS Code ESLint server |
+| `biome` | `.ts`, `.js`, `.json`, `.css`, etc. | `biome.json`, package lockfile | Uses local or global `biome` |
+| `oxlint` | `.ts`, `.tsx`, `.js`, `.jsx`, `.vue` | `.oxlintrc.json`, package lockfile | Requires local install |
+| `vue` | `.vue` | Package lockfile | Auto-installs `@vue/language-server` |
+| `svelte` | `.svelte` | Package lockfile | Auto-installs `svelte-language-server` |
+| `astro` | `.astro` | Package lockfile | Auto-installs `@astrojs/language-server` |
+| `clangd` | `.c`, `.cpp`, `.h`, `.hpp` | `compile_commands.json`, `CMakeLists.txt` | Downloads from GitHub releases |
+| `zls` | `.zig` | `build.zig` | Downloads from GitHub releases |
+| `jdtls` | `.java` | `pom.xml`, `build.gradle` | Downloads Eclipse JDTLS |
+| `elixir-ls` | `.ex`, `.exs` | `mix.exs` | Builds from source |
+| `ruby-lsp` | `.rb`, `.rake` | `Gemfile` | Auto-installs `rubocop` gem |
+| `csharp` | `.cs` | `.sln`, `.csproj` | Auto-installs via `dotnet tool` |
+| `fsharp` | `.fs`, `.fsi` | `.sln`, `.fsproj` | Auto-installs `fsautocomplete` |
+| `sourcekit-lsp` | `.swift` | `Package.swift` | Uses Xcode toolchain |
+| `lua-ls` | `.lua` | `.luarc.json`, `.stylua.toml` | Downloads from GitHub releases |
+| `php intelephense` | `.php` | `composer.json` | Auto-installs via npm |
+| `dart` | `.dart` | `pubspec.yaml` | Requires `dart` CLI |
+| `ocaml-lsp` | `.ml`, `.mli` | `dune-project` | Requires `ocamllsp` |
+| `bash` | `.sh`, `.bash`, `.zsh` | Any directory | Auto-installs `bash-language-server` |
+| `yaml-ls` | `.yaml`, `.yml` | Package lockfile | Auto-installs `yaml-language-server` |
+| `terraform` | `.tf`, `.tfvars` | `.terraform.lock.hcl` | Downloads from GitHub releases |
+| `texlab` | `.tex`, `.bib` | `.latexmkrc` | Downloads from GitHub releases |
+| `dockerfile` | `Dockerfile` | Any directory | Auto-installs via npm |
+| `gleam` | `.gleam` | `gleam.toml` | Requires `gleam` CLI |
+| `clojure-lsp` | `.clj`, `.cljs`, `.cljc` | `deps.edn`, `project.clj` | Requires `clojure-lsp` |
+| `nixd` | `.nix` | `flake.nix` | Requires `nixd` |
+| `tinymist` | `.typ` | `typst.toml` | Downloads from GitHub releases |
+| `haskell-language-server` | `.hs`, `.lhs` | `stack.yaml`, `*.cabal` | Requires HLS wrapper |
+
+#### 1.11.3 LSP Client Implementation
+
+The client (`packages/opencode/src/lsp/client.ts`) uses `vscode-jsonrpc` for communication:
+
+```typescript
+// Client creation (client.ts:42-79)
+export async function create(input: { serverID: string; server: LSPServer.Handle; root: string }) {
+  const connection = createMessageConnection(
+    new StreamMessageReader(input.server.process.stdout),
+    new StreamMessageWriter(input.server.process.stdin),
+  )
+
+  // Handle diagnostics
+  connection.onNotification("textDocument/publishDiagnostics", (params) => {
+    diagnostics.set(filePath, params.diagnostics)
+    Bus.publish(Event.Diagnostics, { path: filePath, serverID: input.serverID })
+  })
+
+  // Initialize LSP handshake
+  await connection.sendRequest("initialize", {
+    rootUri: pathToFileURL(input.root).href,
+    processId: input.server.process.pid,
+    capabilities: {
+      textDocument: {
+        synchronization: { didOpen: true, didChange: true },
+        publishDiagnostics: { versionSupport: true },
+      },
+    },
+  })
+
+  await connection.sendNotification("initialized", {})
+}
+```
+
+#### 1.11.4 LSP Operations
+
+The `LSP` namespace (`packages/opencode/src/lsp/index.ts`) exposes these operations:
+
+| Operation | LSP Request | Purpose |
+|-----------|-------------|---------|
+| `touchFile()` | `textDocument/didOpen` | Notify server of file content |
+| `diagnostics()` | (cached) | Get all current diagnostics |
+| `hover()` | `textDocument/hover` | Get hover information |
+| `definition()` | `textDocument/definition` | Go to definition |
+| `references()` | `textDocument/references` | Find all references |
+| `implementation()` | `textDocument/implementation` | Find implementations |
+| `documentSymbol()` | `textDocument/documentSymbol` | List symbols in file |
+| `workspaceSymbol()` | `workspace/symbol` | Search symbols across workspace |
+| `prepareCallHierarchy()` | `textDocument/prepareCallHierarchy` | Prepare call hierarchy |
+| `incomingCalls()` | `callHierarchy/incomingCalls` | Find callers |
+| `outgoingCalls()` | `callHierarchy/outgoingCalls` | Find callees |
+
+#### 1.11.5 LSP Tool Usage
+
+The experimental `lsp` tool (`packages/opencode/src/tool/lsp.ts`) exposes LSP to the LLM:
+
+```typescript
+// lsp.ts:21-87
+export const LspTool = Tool.define("lsp", {
+  parameters: z.object({
+    operation: z.enum([
+      "goToDefinition", "findReferences", "hover",
+      "documentSymbol", "workspaceSymbol", "goToImplementation",
+      "prepareCallHierarchy", "incomingCalls", "outgoingCalls"
+    ]),
+    filePath: z.string(),
+    line: z.number().int().min(1),      // 1-based (editor style)
+    character: z.number().int().min(1), // 1-based (editor style)
+  }),
+  execute: async (args) => {
+    await LSP.touchFile(file, true)  // Ensure file is open in LSP
+
+    switch (args.operation) {
+      case "goToDefinition": return LSP.definition(position)
+      case "findReferences": return LSP.references(position)
+      // ... other operations
+    }
+  },
+})
+```
+
+**Enabling the LSP Tool:**
+```bash
+OPENCODE_EXPERIMENTAL_LSP_TOOL=1 opencode
+```
+
+#### 1.11.6 LSP Server Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant OpenCode
+    participant LSP as LSP Namespace
+    participant Server as LSP Server
+
+    User->>OpenCode: Edit/touch file.ts
+    OpenCode->>LSP: touchFile("file.ts")
+
+    alt Server not running
+        LSP->>LSP: Find server for .ts extension
+        LSP->>Server: spawn(typescript-language-server)
+        LSP->>Server: initialize request
+        Server-->>LSP: capabilities
+        LSP->>Server: initialized notification
+    end
+
+    LSP->>Server: textDocument/didOpen
+    Server-->>LSP: textDocument/publishDiagnostics
+    LSP->>OpenCode: diagnostics available
+
+    Note over User,Server: Later...
+
+    User->>OpenCode: Exit
+    OpenCode->>LSP: shutdown all clients
+    LSP->>Server: shutdown request
+    Server-->>LSP: ack
+    LSP->>Server: kill process
+```
+
+#### 1.11.7 Diagnostics Integration
+
+LSP diagnostics are used for:
+
+1. **Edit validation**: After file modifications, diagnostics show errors
+2. **Build feedback**: Type errors, lint warnings surfaced to LLM
+3. **Code quality**: Helps LLM understand if changes break things
+
+```typescript
+// Diagnostics format (from lsp/index.ts:469-483)
+export namespace Diagnostic {
+  export function pretty(diagnostic: LSPClient.Diagnostic) {
+    const severityMap = {
+      1: "ERROR",
+      2: "WARN",
+      3: "INFO",
+      4: "HINT",
+    }
+    const severity = severityMap[diagnostic.severity || 1]
+    const line = diagnostic.range.start.line + 1
+    const col = diagnostic.range.start.character + 1
+    return `${severity} [${line}:${col}] ${diagnostic.message}`
+  }
+}
+```
+
 ---
 
 ## 2. Codebase Architecture
